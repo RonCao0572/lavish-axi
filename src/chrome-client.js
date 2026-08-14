@@ -147,6 +147,109 @@ function escapeHtml(value) {
   );
 }
 
+// #region chat-markdown
+// Kept in one contiguous region so the unit test can evaluate it without
+// standing up a fake DOM. Move it and the test fails loudly rather than
+// silently covering nothing.
+
+const CHAT_LINK_SCHEME = /^https?:\/\//i;
+
+/**
+ * Apply inline Markdown to a single already-escaped line.
+ *
+ * Code spans are split out first so their contents stay literal: `**` inside
+ * backticks is text, not emphasis.
+ *
+ * @param {string} escaped a line that has already passed through escapeHtml
+ * @returns {string}
+ */
+function renderChatInline(escaped) {
+  return escaped
+    .split(/(`[^`]+`)/)
+    .map((part, index) => {
+      if (index % 2 === 1) return "<code>" + part.slice(1, -1) + "</code>";
+      return part
+        .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (whole, label, href) =>
+          CHAT_LINK_SCHEME.test(href)
+            ? '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + label + "</a>"
+            : label,
+        )
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/(^|[^*])\*([^*]+)\*/g, "$1<em>$2</em>");
+    })
+    .join("");
+}
+
+/**
+ * Render the Markdown subset agents actually emit in chat: fenced and inline
+ * code, bold, italic, links, bullet lists, and blockquotes.
+ *
+ * Order is the safety property. The whole string is escaped first, so every
+ * `<`, `>`, `&`, `"` and `'` is already inert and every tag below is one this
+ * function emitted. Reviewer text and agent text both reach innerHTML through
+ * here, so neither can smuggle markup. Note that blockquotes match `&gt;`
+ * rather than `>` because escaping has already run.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function renderChatMarkdown(value) {
+  const lines = escapeHtml(value).split("\n");
+  const out = [];
+  let paragraph = [];
+  let quote = [];
+  let list = [];
+
+  const flush = () => {
+    if (paragraph.length) {
+      out.push("<p>" + paragraph.map(renderChatInline).join("<br>") + "</p>");
+      paragraph = [];
+    }
+    if (quote.length) {
+      out.push("<blockquote>" + quote.map(renderChatInline).join("<br>") + "</blockquote>");
+      quote = [];
+    }
+    if (list.length) {
+      out.push("<ul>" + list.map((item) => "<li>" + renderChatInline(item) + "</li>").join("") + "</ul>");
+      list = [];
+    }
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+
+    if (/^\s*```/.test(line)) {
+      flush();
+      const body = [];
+      for (index += 1; index < lines.length && !/^\s*```/.test(lines[index]); index += 1) {
+        body.push(lines[index]);
+      }
+      out.push("<pre><code>" + body.join("\n") + "</code></pre>");
+      continue;
+    }
+
+    const quoted = line.match(/^\s*&gt;\s?(.*)$/);
+    const bullet = line.match(/^\s*[-*]\s+(.*)$/);
+
+    if (quoted) {
+      if (paragraph.length || list.length) flush();
+      quote.push(quoted[1]);
+    } else if (bullet) {
+      if (paragraph.length || quote.length) flush();
+      list.push(bullet[1]);
+    } else if (!line.trim()) {
+      flush();
+    } else {
+      if (quote.length || list.length) flush();
+      paragraph.push(line);
+    }
+  }
+
+  flush();
+  return out.join("");
+}
+// #endregion chat-markdown
+
 function loadJsonState(storageKey, fallback) {
   try {
     const raw = sessionStorage.getItem(storageKey);
@@ -273,7 +376,12 @@ function addChat(role, text, shouldScroll = true) {
 
   const el = document.createElement("div");
   el.className = "bubble " + role;
-  el.innerHTML = "<small>" + (role === "agent" ? "Agent" : "You") + "</small><div>" + escapeHtml(text) + "</div>";
+  el.innerHTML =
+    "<small>" +
+    (role === "agent" ? "Agent" : "You") +
+    '</small><div class="bubble-body">' +
+    renderChatMarkdown(text) +
+    "</div>";
   chatLog.appendChild(el);
   if (shouldScroll) scrollElementIntoView(el);
   return el;
